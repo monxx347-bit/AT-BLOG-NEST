@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlogNest</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#222;line-height:1.5;}
+  h1{margin-bottom:4px;}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:8px;}
+  input,textarea{width:100%;padding:8px;margin:6px 0;border:1px solid #ccc;border-radius:4px;font:inherit;box-sizing:border-box;}
+  textarea{min-height:80px;}
+  button{padding:8px 14px;border:none;border-radius:4px;background:#333;color:#fff;cursor:pointer;font:inherit;}
+  button:hover{background:#000;}
+  button.small{background:none;color:#333;text-decoration:underline;padding:0;font-size:13px;}
+  .post{border-bottom:1px solid #ddd;padding:16px 0;}
+  .post h3{margin:0 0 4px;}
+  .meta{font-size:13px;color:#777;margin:0 0 8px;}
+  .box{border:1px solid #ddd;border-radius:6px;padding:16px;margin-bottom:24px;}
+  .error{color:#b00;font-size:13px;}
+  .toggle{font-size:13px;margin-bottom:24px;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>BlogNest</h1>
+  <div id="authArea"></div>
+</header>
+
+<div id="formArea"></div>
+
+<div id="feed"></div>
+
+<script>
+const API = `${window.location.protocol === 'file:' ? 'http://localhost:5000' : window.location.origin}/api`;
+const TOKEN_KEY = 'blogNestToken';
+let token = localStorage.getItem(TOKEN_KEY), user = null, posts = [], mode = 'login', useAI = false, expanded = null;
+
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  let res;
+  try {
+    res = await fetch(API + path, { ...opts, headers });
+  } catch (err) {
+    throw new Error(`Could not reach the backend at ${API}. Start the API server and try again.`);
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const validationErrors = data && Array.isArray(data.errors)
+      ? data.errors.map(error => error.msg).filter(Boolean).join(', ')
+      : '';
+    throw new Error((data && data.message) || validationErrors || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function loadPosts() {
+  posts = await api('/blogs');
+  renderFeed();
+}
+
+function renderAuth() {
+  const el = document.getElementById('authArea');
+  el.innerHTML = user
+    ? `Hi, ${esc(user.name)} <button class="small" id="logout">Log out</button>`
+    : `<button class="small" id="showAuth">Sign in</button>`;
+  if (user) document.getElementById('logout').onclick = () => {
+    token = null;
+    user = null;
+    localStorage.removeItem(TOKEN_KEY);
+    render();
+  };
+  else document.getElementById('showAuth').onclick = () => { mode = 'login'; render(); };
+}
+
+function renderForm() {
+  const el = document.getElementById('formArea');
+  if (!user) {
+    if (mode !== 'login' && mode !== 'register') { el.innerHTML = ''; return; }
+    el.innerHTML = `
+      <div class="box">
+        <form id="authForm">
+          ${mode === 'register' ? '<input id="name" placeholder="Name" required>' : ''}
+          <input id="email" type="email" placeholder="Email" required>
+          <input id="password" type="password" placeholder="Password" required minlength="6">
+          <button type="submit">${mode === 'register' ? 'Create account' : 'Sign in'}</button>
+          <div class="error" id="authErr"></div>
+        </form>
+        <p class="toggle">${mode === 'register' ? 'Have an account?' : 'New here?'}
+          <a href="#" id="switchMode">${mode === 'register' ? 'Sign in' : 'Create one'}</a></p>
+      </div>`;
+    document.getElementById('switchMode').onclick = (e) => { e.preventDefault(); mode = mode === 'register' ? 'login' : 'register'; render(); };
+    document.getElementById('authForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const errEl = document.getElementById('authErr');
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      try {
+        if (mode === 'register') {
+          await api('/auth/register', { method: 'POST', body: JSON.stringify({ name: document.getElementById('name').value.trim(), email, password }) });
+        }
+        const res = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+        token = res.token;
+        localStorage.setItem(TOKEN_KEY, token);
+        user = await api('/auth/profile');
+        mode = null;
+        render();
+      } catch (err) { errEl.textContent = err.message; }
+    };
+  } else {
+    el.innerHTML = `
+      <div class="box">
+        <form id="postForm">
+          <input id="title" placeholder="Title" ${useAI ? 'style="display:none" disabled' : 'required'}>
+          <input id="category" placeholder="Category" ${useAI ? '' : 'required'}>
+          <textarea id="content" placeholder="${useAI ? 'Topic for the AI to write about' : 'Write your post...'}" required></textarea>
+          <button type="submit">${useAI ? 'Generate with AI' : 'Publish'}</button>
+          <div class="error" id="postErr"></div>
+        </form>
+        <p class="toggle"><a href="#" id="switchWrite">${useAI ? 'Write it myself instead' : 'Let AI write it instead'}</a></p>
+      </div>`;
+    document.getElementById('switchWrite').onclick = (e) => { e.preventDefault(); useAI = !useAI; renderForm(); };
+    document.getElementById('postForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const errEl = document.getElementById('postErr');
+      const category = document.getElementById('category').value.trim();
+      try {
+        let post;
+        if (useAI) {
+          const body = { topic: document.getElementById('content').value.trim() };
+          if (category) body.category = category;
+          post = await api('/ai/generate-blog', { method: 'POST', body: JSON.stringify(body) });
+        } else {
+          post = await api('/blogs', { method: 'POST', body: JSON.stringify({
+            title: document.getElementById('title').value.trim(),
+            category,
+            content: document.getElementById('content').value.trim()
+          }) });
+        }
+        posts.unshift(post);
+        e.target.reset();
+        renderFeed();
+      } catch (err) { errEl.textContent = err.message; }
+    };
+  }
+}
+
+function renderFeed() {
+  const el = document.getElementById('feed');
+  if (!posts.length) { el.innerHTML = '<p>No posts yet.</p>'; return; }
+  el.innerHTML = posts.map(p => {
+    const open = expanded === p._id;
+    const mine = user && p.author && p.author._id === user.id;
+    return `
+      <div class="post">
+        <h3>${esc(p.title)}</h3>
+        <p class="meta">${esc(p.category)} · ${esc(p.authorName)} · ${new Date(p.createdAt).toLocaleDateString()}</p>
+        <p>${open ? esc(p.content) : esc(p.content).slice(0, 140) + (p.content.length > 140 ? '…' : '')}</p>
+        <button class="small" data-toggle="${p._id}">${open ? 'Show less' : 'Read more'}</button>
+        ${mine ? ` &nbsp; <button class="small" data-delete="${p._id}">Delete</button>` : ''}
+      </div>`;
+  }).join('');
+  el.querySelectorAll('[data-toggle]').forEach(b => b.onclick = () => { expanded = expanded === b.dataset.toggle ? null : b.dataset.toggle; renderFeed(); });
+  el.querySelectorAll('[data-delete]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this post?')) return;
+    try {
+      await api('/blogs/' + b.dataset.delete, { method: 'DELETE' });
+      posts = posts.filter(p => p._id !== b.dataset.delete);
+      renderFeed();
+    } catch (err) {
+      alert(err.message);
+    }
+  });
+}
+
+function render() { renderAuth(); renderForm(); renderFeed(); }
+
+(async function init() {
+  if (token) {
+    try {
+      user = await api('/auth/profile');
+    } catch (err) {
+      token = null;
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  }
+  render();
+  try {
+    await loadPosts();
+  } catch (err) {
+    document.getElementById('feed').innerHTML = `<p class="error">${esc(err.message)}</p>`;
+  }
+})();
+</script>
+</body>
+</html>
